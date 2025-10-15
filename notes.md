@@ -255,6 +255,33 @@ speedrun.sh                                          │ downloads
 | - compute_cleanup()                                         |
 +------------------------------------------------------------+
 
+#### 流程说明
+- **用户配置**（`scripts/base_train.py:29-57`）：设定默认超参并允许通过 `nanochat/configurator.py` 覆盖，形成 `user_config` 供日志与报告引用。
+- **计算环境初始化**（`scripts/base_train.py:59-63`）：`compute_init()` 建立 DDP/设备上下文，判定 `master_process`，创建 BF16 CUDA 的 `autocast_ctx`。
+- **Wandb 会话**（`scripts/base_train.py:65-66`）：决定使用真实 wandb 还是 `DummyWandb`，保证后续日志调用一致。
+- **分词器与词表**（`scripts/base_train.py:68-72`）：加载 tokenizer、GPU 上的 `token_bytes`，取得 `vocab_size` 供模型与采样使用。
+
+#### 模型与数据准备
+- **模型结构派生**（`scripts/base_train.py:74-125`）：按深度推导层数/维度/头数，在 `meta` 设备上构造 `GPT` 并迁移至 GPU，保留 `orig_model` 及 `torch.compile` 版本，同时统计参数量与单 token FLOPs。
+- **训练跨度决策**（`scripts/base_train.py:127-149`）：根据迭代数、目标 FLOPs 或数据:参数比计算 `num_iterations`、`total_tokens` 等核心指标。
+- **优化器初始化**（`scripts/base_train.py:129-131`）：调用 `model.setup_optimizers` 返回 AdamW 与 Muon，便于分别调节学习率和动量。
+- **数据加载器**（`scripts/base_train.py:133-138`）：定位数据目录，构建训练/验证的分布式加载器并预取首批 `(x, y)`。
+- **调度函数**（`scripts/base_train.py:141-163`）：定义学习率倍率与 Muon 动量曲线，为训练步骤更新提供工具。
+
+#### 训练循环关键环节
+- **循环控制**（`scripts/base_train.py:166-175`）：遍历 `num_iterations + 1` 步，实时维护最优验证损失、EMA 损失、累计 FLOPs 与耗时。
+- **验证评估**（`scripts/base_train.py:176-192`）：按 `eval_every` 或最后一步调用 `evaluate_bpb`，记录最优 bpb，并通过 wandb 上报。
+- **CORE 指标**（`scripts/base_train.py:194-206`）：以未编译模型执行 `evaluate_model`，获得 `core_metric` 与 `centered_results`。
+- **采样输出**（`scripts/base_train.py:209-228`）：主进程周期性用 `Engine` 生成若干提示的样例，快速感知模型表现。
+- **检查点写入**（`scripts/base_train.py:230-247`）：在最后一步由主进程调用 `save_checkpoint`，保存模型、优化器状态与配置元数据。
+- **单步训练**（`scripts/base_train.py:253-280`）：混合精度前向、梯度累积、裁剪、调度更新与优化器 `step`，随后清零梯度并统计时延。
+- **日志统计**（`scripts/base_train.py:283-304`）：更新 EMA 损失、吞吐量、MFU 等指标，定期打印并写入 wandb。
+
+#### 收尾阶段
+- **终端统计**（`scripts/base_train.py:306-309`）：输出峰值显存、总训练时长、最优验证损失。
+- **训练报告**（`scripts/base_train.py:311-335`）：通过 `get_report().log` 提交配置、训练设置与结果三大块信息。
+- **资源清理**（`scripts/base_train.py:337-339`）：结束 wandb 会话并执行 `compute_cleanup()` 释放分布式资源。
+
 ### GPT Block 框图
 ```
 tokens (B,T)
@@ -297,3 +324,8 @@ rms_norm
    ▼
 lm_head (untied, bf16→fp32 logits, softcap)
 ```
+
+## 训练循环与模型内部的关系
+- `scripts/base_train.py` 的训练循环负责“如何训练”：按步骤拉数据、调用 `model(x, y)` 得到 loss、执行 `loss.backward()`、优化器 `step`、梯度裁剪、日志和 checkpoint 等（参见 `scripts/base_train.py:166-304`）。
+- `GPT(model_config)` 则定义“模型是什么”：注意力、MLP、残差、LayerNorm 等全部封装在 `nanochat/gpt.py` 的模块实现中。当循环调用 `model(x, y)` 时，内部会通过这些 Transformer block 计算输出，并在反向传播时产生梯度。
+- 因此，训练循环与 Transformer block 是上下两层：循环驱动训练流程，模型内部结构在每次 `model(x, y)` 和随后的参数更新中被使用和修改。循环不会并行运行其他模型，只是对同一个 `GPT` 实例反复执行前向/反向。
